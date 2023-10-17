@@ -12,7 +12,7 @@ from torch.optim import Adam
 from pathlib import Path
 
 from params import model_cfg as cfg
-from architectures.gap_fill_attn import AttnGapFill, PureAuxPred
+from architectures.gap_fill_attn import AttnGapFill, NbrAttnGapFill#, PureAuxPred
 from data_generator import gap_generator
 from utils import *
 
@@ -22,16 +22,23 @@ if __name__=="__main__":
     batch_size = 8
     max_epochs = 1000
     train_batches_per_epoch = 400
-    val_batches_per_epoch = 150    
+    val_batches_per_epoch = 150
+    load_old_model = True
     
     log_dir = '/home/users/doran/projects/infilling/logs/'
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     
-    model_name = 'infill'
     #model_name = 'aux_infill'
+    if load_old_model:
+        # old model to load early layers from
+        old_model_name = 'infill'    
+        old_model_outdir = f'{log_dir}/{old_model_name}/'    
+        Path(old_model_outdir).mkdir(parents=True, exist_ok=True)    
+        old_specify_chkpnt = f'{old_model_name}/checkpoint.pth' # if None, load best, otherwise "modelname/checkpoint.pth"
+        
+    model_name = 'infill_nbrattn'
     model_outdir = f'{log_dir}/{model_name}/'    
-    Path(model_outdir).mkdir(parents=True, exist_ok=True)
-    
+    Path(model_outdir).mkdir(parents=True, exist_ok=True)    
     specify_chkpnt = f'{model_name}/checkpoint.pth' # if None, load best, otherwise "modelname/checkpoint.pth"
     reset_chkpnt = False
     load_prev_chkpnt = True
@@ -43,28 +50,79 @@ if __name__=="__main__":
     
     # create data generator and model
     dg = gap_generator()
-    model = AttnGapFill(cfg)
-    #model = PureAuxPred(cfg)
     
+    #model = PureAuxPred(cfg)
+    if load_old_model:
+        old_model = AttnGapFill(cfg)
+        old_model.to(device)
+        
+    model = NbrAttnGapFill(cfg)    
     model.to(device)
     
     # create optimizer and load checkpoint
-    optimizer = Adam(model.parameters(), lr=cfg.lr)
-    model, optimizer, checkpoint = setup_checkpoint(
-        model, optimizer, device, load_prev_chkpnt,
-        model_outdir, log_dir,
-        specify_chkpnt=specify_chkpnt,
-        reset_chkpnt=reset_chkpnt
-    )
-
-    loss_func = make_loss_func(weight_gaps=5, use_non_gaps=True,
+    if load_old_model:
+        old_model, _, _ = setup_checkpoint(
+            old_model, None, device, load_prev_chkpnt,
+            old_model_outdir, log_dir,
+            specify_chkpnt=specify_chkpnt,
+            reset_chkpnt=reset_chkpnt
+        )
+        old_model_state = old_model.state_dict()
+        # remove same-named predict layers
+        samename = ['pred1.weight', 'pred1.bias', 'pred2.weight', 'pred2.bias']
+        for sm in samename: old_model_state.pop(sm)
+        
+        model.load_state_dict(old_model_state, strict=False)
+        
+        # freeze layers before neighbour attention
+        for param in model.parameters():
+            param.requires_grad = False
+        # unfreeze only layers we want to train
+        model.allvar_nbr_attn.requires_grad_(True)
+        model.precip_nbr_attn.requires_grad_(True)
+        model.embed_for_precip.requires_grad_(True)
+        model.pred1.requires_grad_(True)
+        model.pred2.requires_grad_(True)
+        model.pred_precip1.requires_grad_(True)
+        model.pred_precip2.requires_grad_(True)
+        
+        optimizer = Adam(model.parameters(), lr=cfg.lr)
+        checkpoint = None
+    else:
+        optimizer = Adam(model.parameters(), lr=cfg.lr)
+        model, optimizer, checkpoint = setup_checkpoint(
+            model, optimizer, device, load_prev_chkpnt,
+            model_outdir, log_dir,
+            specify_chkpnt=specify_chkpnt,
+            reset_chkpnt=reset_chkpnt
+        )    
+    
+    """
+    need new loss function for precip / other var split output
+    do as neg log likelihood and estimate error as output too
+    """
+    loss_func = make_loss_func(weight_gaps=5,
+                               use_non_gaps=True,
                                enforce_gap_endpoints=True,
-                               weight_endpoints=1)
+                               weight_endpoints=1
+    )
     train_step = make_train_step(model, optimizer, loss_func)
     val_step = make_val_step(model, loss_func)
     losses, val_losses, curr_epoch, best_loss = prepare_run(checkpoint)
 
     if False:
+        epoch = curr_epoch
+        batch = dg.get_batch(batch_size,
+                     const_l=True,
+                     batch_type='train',
+                     min_gap_logprob=logprob_vargap_seq[epoch],
+                     mean_gap_length=gap_length_seq[epoch],
+                     gap_length_sd=gap_sd_seq[epoch],
+                     shortrange=cfg.shortrange,
+                     longrange=cfg.longrange)
+        batch = send_batch_to_device(batch, device)
+        
+        
         plt.plot(checkpoint['losses'])
         plt.plot(checkpoint['val_losses'])
         plt.show()

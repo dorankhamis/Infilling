@@ -11,8 +11,13 @@ model_cfg = SimpleNamespace(
     lr = 5e-5,
     features_aux = 10,
     embed_aux = 64,
+    # nbr params
     shortrange = 10,
-    longrange = 60
+    longrange = 60,    
+    # node_aux_channels == features_aux
+    edge_aux_channels = 16,
+    Natt_h_nbr = 2,
+    precip_embed = 32
 )
 
 normalisation = SimpleNamespace(    

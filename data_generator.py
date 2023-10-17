@@ -122,7 +122,7 @@ def tensorise_nbr_data(nbr_data):
         )
         nbr_data[ii]['attention_mask'] = torch.unsqueeze(
             torch.from_numpy(
-                nbr_data[ii]['attention_mask'].astype(np.float32)
+                nbr_data[ii]['attention_mask'].astype(torch.bool)
             ), 0
         )
         nbr_data[ii]['node_aux'] = torch.unsqueeze(            
@@ -386,11 +386,11 @@ class gap_generator():
         )
         edge_aux += [distance]
         # and the initial bearing between home and nbr
-        bearing_theta = init_bearing(
-            home_meta.LATITUDE.values[0], home_meta.LONGITUDE.values[0],
-            nbr_meta.LATITUDE.values[0], nbr_meta.LONGITUDE.values[0]
-        )
-        edge_aux += [bearing_theta / 3.] # normalise as goes between -pi, pi
+        # bearing_theta = init_bearing(
+            # home_meta.LATITUDE.values[0], home_meta.LONGITUDE.values[0],
+            # nbr_meta.LATITUDE.values[0], nbr_meta.LONGITUDE.values[0]
+        # )
+        # edge_aux += [bearing_theta / 3.] # normalise as goes between -pi, pi
         return node_aux, edge_aux
     
     def get_batch(self, batch_size,
@@ -588,7 +588,7 @@ class gap_generator():
             # create attention mask
             precip_nbr_data[i]['attention_mask'] = np.ones((data.shape[0], precip_nbr_data[i]['timeseries'].shape[0]), dtype=bool)
             mask_inds = np.where(np.stack([precip_nbr_data[i]['real_gap_masks'][v] for v in ['PRECIP']], axis=0).sum(axis=0) == 1)[0]
-            precip_nbr_data[i]['attention_mask'][:,mask_inds] = False # check this!
+            precip_nbr_data[i]['attention_mask'][:,mask_inds] = False
 
         for i in range(len(allvar_nbr_data)):
             allvar_nbr_data[i]['real_gap_masks'] = create_real_gap_masks(allvar_nbr_data[i]['timeseries'])
@@ -600,7 +600,7 @@ class gap_generator():
             # create attention mask
             allvar_nbr_data[i]['attention_mask'] = np.ones((data.shape[0], allvar_nbr_data[i]['timeseries'].shape[0]), dtype=bool)
             mask_inds = np.where(np.stack([allvar_nbr_data[i]['real_gap_masks'][v] for v in data.columns], axis=0).sum(axis=0) == len(data.columns))[0]
-            allvar_nbr_data[i]['attention_mask'][:,mask_inds] = False # check this!
+            allvar_nbr_data[i]['attention_mask'][:,mask_inds] = False
        
         ## create auxiliary data
         home_site_meta = self.metadata.site.set_index('SITE_ID').loc[SID]
