@@ -56,8 +56,10 @@ if __name__=="__main__":
         old_model = AttnGapFill(cfg)
         old_model.to(device)
         
-    model = NbrAttnGapFill(cfg)    
+    model = NbrAttnGapFill(cfg)
     model.to(device)
+    
+    #cfg.lr = 1e-6
     
     # create optimizer and load checkpoint
     if load_old_model:
@@ -85,6 +87,10 @@ if __name__=="__main__":
         model.pred2.requires_grad_(True)
         model.pred_precip1.requires_grad_(True)
         model.pred_precip2.requires_grad_(True)
+        model.logsig1.requires_grad_(True)
+        model.logsig2.requires_grad_(True)
+        model.logsig_precip1.requires_grad_(True)
+        model.logsig_precip2.requires_grad_(True)
         
         optimizer = Adam(model.parameters(), lr=cfg.lr)
         checkpoint = None
@@ -95,34 +101,55 @@ if __name__=="__main__":
             model_outdir, log_dir,
             specify_chkpnt=specify_chkpnt,
             reset_chkpnt=reset_chkpnt
-        )    
+        )
     
     """
     need new loss function for precip / other var split output
     do as neg log likelihood and estimate error as output too
     """
-    loss_func = make_loss_func(weight_gaps=5,
-                               use_non_gaps=True,
-                               enforce_gap_endpoints=True,
-                               weight_endpoints=1
+    # loss_func = make_loss_func(weight_gaps=5,
+                               # use_non_gaps=True,
+                               # enforce_gap_endpoints=True,
+                               # weight_endpoints=1
+    # )
+    loss_func = make_nll_loss(
+        weight_gaps=5,
+        use_non_gaps=True,
+        enforce_gap_endpoints=True,
+        weight_endpoints=1
     )
     train_step = make_train_step(model, optimizer, loss_func)
-    val_step = make_val_step(model, loss_func)
+    val_step = make_val_step(model, loss_func)    
     losses, val_losses, curr_epoch, best_loss = prepare_run(checkpoint)
-
+        
+    print("Trainable parameters: %d" % count_parameters(model))
+    print("Non-trainable parameters: %d" % count_parameters(model, trainable=False))
+    
     if False:
         epoch = curr_epoch
-        batch = dg.get_batch(batch_size,
-                     const_l=True,
-                     batch_type='train',
-                     min_gap_logprob=logprob_vargap_seq[epoch],
-                     mean_gap_length=gap_length_seq[epoch],
-                     gap_length_sd=gap_sd_seq[epoch],
-                     shortrange=cfg.shortrange,
-                     longrange=cfg.longrange)
+        
+        batch = dg.get_batch(
+            batch_size,
+            const_l=True,
+            batch_type='train',
+            min_gap_logprob=logprob_vargap_seq[epoch],
+            mean_gap_length=gap_length_seq[epoch],
+            gap_length_sd=gap_sd_seq[epoch],
+            shortrange=cfg.shortrange,
+            longrange=cfg.longrange
+        )
         batch = send_batch_to_device(batch, device)
         
+        pred, logsig, p_pred, p_logsig = model(
+            batch['inputs'],
+            batch['aux_inputs'],
+            precip_nbr_data=batch['precip_nbrs'],
+            allvar_nbr_data=batch['allvar_nbrs']
+        )
+        loss = loss_func(pred, logsig, p_pred, p_logsig, batch)
+        print(loss)
         
+                
         plt.plot(checkpoint['losses'])
         plt.plot(checkpoint['val_losses'])
         plt.show()
@@ -159,8 +186,8 @@ if __name__=="__main__":
             axs2[i//ncols, i%ncols].plot(batch['aux_inputs'][b,i,:].numpy())            
             axs2[i//ncols, i%ncols].title.set_text(batch['metadata'][0]['aux_var_order'][i])
         plt.show()
-        
-        
+
+    
     ## fit the model
     model.train()
     for epoch in range(curr_epoch, max_epochs):
@@ -180,12 +207,19 @@ if __name__=="__main__":
                                  shortrange=cfg.shortrange,
                                  longrange=cfg.longrange)
             batch = send_batch_to_device(batch, device)
-            loss = train_step(batch)                 
+            loss = train_step(batch)
+            
+            if loss=='STOP': break
+            
             print_values = [('loss', loss)]
             kbar.update(bidx, values=print_values)
             running_loss.append(loss)
         losses.append(np.mean(running_loss)) # append epoch average loss
-            
+        
+        if loss=='STOP': 
+            print('Stopping due to nan loss')
+            break
+        
         with torch.no_grad():
             kbarv = pkbar.Kbar(target=val_batches_per_epoch,
                                epoch=epoch,
@@ -204,10 +238,17 @@ if __name__=="__main__":
                                      longrange=cfg.longrange)
                 batch = send_batch_to_device(batch, device)
                 loss = val_step(batch)
+                
+                if loss=='STOP': break
+                
                 print_values = [('val_loss', loss)]
                 kbarv.update(bidx, values=print_values)
                 running_loss.append(loss)
-                    
+            
+            if loss=='STOP':
+                print('Stopping due to nan loss')
+                break
+            
             val_losses.append(np.mean(running_loss))
             kbar.add(1, values=[('val_loss', val_losses[-1])])        
             is_best = bool(val_losses[-1] < best_loss)

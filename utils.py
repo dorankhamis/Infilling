@@ -7,6 +7,15 @@ import pkbar
 import shutil
 from pathlib import Path
 
+SQRT2PI = np.sqrt(2 * np.pi)
+EPS = 1e-9
+
+def count_parameters(model, trainable=True):
+    if trainable:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    else:
+        return sum(p.numel() for p in model.parameters() if not p.requires_grad)
+
 def dist_lat_lon(lat1, lon1, lat2, lon2, R = 10.):
     # Haversine formula
     # R = 6371 # km, Earth's radius, used as a scale factor here
@@ -25,24 +34,56 @@ def init_bearing(lat1, lon1, lat2, lon2):
         np.cos(np.deg2rad(lon2 - lon1))
     )
 
-def make_train_step(model, optimizer, loss_func):
+def make_train_step(model, optimizer, loss_func, stop_on_nan=True):
     def train_step(batch):
         model.train()
-        pred = model(batch['inputs'], batch['aux_inputs'])
-        loss = loss_func(pred, batch)
+        
+        ## old
+        # pred = model(batch['inputs'], batch['aux_inputs'])
+        # loss = loss_func(pred, batch)
+        
+        pred, logsig, p_pred, p_logsig = model(
+            batch['inputs'],
+            batch['aux_inputs'],
+            precip_nbr_data=batch['precip_nbrs'],
+            allvar_nbr_data=batch['allvar_nbrs']
+        )
+        loss = loss_func(pred, logsig, p_pred, p_logsig, batch)
+        
+        if stop_on_nan:
+            if np.isnan(loss.item()):
+                return 'STOP'
+        
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
         return loss.item()
     return train_step
 
-def make_val_step(model, loss_func):
+def make_val_step(model, loss_func, stop_on_nan=True):
     def val_step(batch):
-        model.eval()        
-        pred = model(batch['inputs'], batch['aux_inputs'])
-        loss = loss_func(pred, batch)
+        model.eval()
+        
+        ## old
+        # pred = model(batch['inputs'], batch['aux_inputs'])
+        # loss = loss_func(pred, batch)
+        
+        pred, logsig, p_pred, p_logsig = model(
+            batch['inputs'],
+            batch['aux_inputs'],
+            precip_nbr_data=batch['precip_nbrs'],
+            allvar_nbr_data=batch['allvar_nbrs']
+        )
+        loss = loss_func(pred, logsig, p_pred, p_logsig, batch)
+        
+        if stop_on_nan:
+            if np.isnan(loss.item()):
+                return 'STOP'
+        
         return loss.item()
     return val_step
+    
+    
 
 def make_loss_func(weight_gaps=1., use_non_gaps=False,
                    enforce_gap_endpoints=True, weight_endpoints=1.):
@@ -71,6 +112,65 @@ def make_loss_func(weight_gaps=1., use_non_gaps=False,
         return gap_loss
         
     return gap_mse_loss
+
+def normal_loglikelihood(mu, x, sigma):
+    return 0.5 * ((x - mu)/(sigma + EPS)) * ((x - mu)/(sigma + EPS)) + torch.log(sigma * SQRT2PI + EPS)
+
+def make_nll_loss(weight_gaps=1., use_non_gaps=False,
+                  enforce_gap_endpoints=True, weight_endpoints=1.):
+    
+    def gap_nll_loss(pred, logsig, p_pred, p_logsig, batch):
+        p_ind = batch['metadata'][0]['var_order'].index('PRECIP')
+        pred = torch.cat([pred[:,:p_ind,:], p_pred, pred[:,p_ind:,:]], dim=1)
+        sigma = torch.cat([logsig[:,:p_ind,:], p_logsig, logsig[:,p_ind:,:]], dim=1)
+        sigma = torch.exp(sigma)
+        
+        fake_gap_mask = (batch['our_gaps'])*(~batch['existing_gaps'])
+        gap_loss = weight_gaps * normal_loglikelihood(
+            batch['targets'][fake_gap_mask],
+            pred[fake_gap_mask],
+            sigma[fake_gap_mask]
+        ).mean()
+        
+        if enforce_gap_endpoints:
+            endpoint_loss = gap_loss * 0
+            num = 0
+            for b in range(len(batch['metadata'])):
+                #for var in np.setdiff1d(batch['metadata'][b]['var_order'], ['PRECIP']):
+                for var in batch['metadata'][b]['var_order']:
+                    ii = np.where(np.array(batch['metadata'][b]['var_order'])==var)[0][0]
+                    if batch['metadata'][b]['tot_our_gaps'][var]>0:
+                        gap_inds = torch.where(batch['our_gaps'][b,ii,:])[0]
+                        if (gap_inds[0]-1)>=0 and not batch['existing_gaps'][b,ii,gap_inds[0]-1]:
+                            endpoint_loss += normal_loglikelihood(
+                                batch['targets'][b,ii,gap_inds[0]-1],
+                                pred[b,ii,gap_inds[0]-1],
+                                sigma[b,ii,gap_inds[0]-1]
+                            ).mean()
+                            num += 1
+                        if ((gap_inds[0]+1)<len(batch['our_gaps'][b,ii,:]) and 
+                            not batch['existing_gaps'][b,ii,gap_inds[0]+1]):
+                            endpoint_loss += normal_loglikelihood(
+                                batch['targets'][b,ii,gap_inds[0]+1],
+                                pred[b,ii,gap_inds[0]+1],
+                                sigma[b,ii,gap_inds[0]+1]
+                            ).mean()
+                            num += 1
+            if num>0:
+                gap_loss += weight_endpoints * endpoint_loss / num
+            
+        if use_non_gaps:
+            nongap_mask = (~batch['our_gaps'])*(~batch['existing_gaps'])
+            nongap_loss = normal_loglikelihood(
+                batch['targets'][nongap_mask],
+                pred[nongap_mask],
+                sigma[nongap_mask]
+            ).mean()            
+            gap_loss += nongap_loss
+        
+        return gap_loss
+        
+    return gap_nll_loss
 
 def update_checkpoint(epoch, model, optimizer, best_loss, losses, val_losses):
     return {'epoch': epoch,

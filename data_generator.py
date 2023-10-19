@@ -120,16 +120,19 @@ def tensorise_nbr_data(nbr_data):
                 nbr_data[ii]['masked_data'].values.astype(np.float32)
             ).T, 0
         )
+        
         nbr_data[ii]['attention_mask'] = torch.unsqueeze(
             torch.from_numpy(
-                nbr_data[ii]['attention_mask'].astype(torch.bool)
+                nbr_data[ii]['attention_mask']
             ), 0
-        )
+        ).to(torch.bool)
+        
         nbr_data[ii]['node_aux'] = torch.unsqueeze(            
             torch.from_numpy(
                 nbr_data[ii]['node_aux'].values.astype(np.float32)
             ).T, 0
         )
+        
         # create pseudo batch and time dim
         # nbr_data[ii]['node_aux'] = torch.unsqueeze(
             # torch.unsqueeze(
@@ -137,6 +140,7 @@ def tensorise_nbr_data(nbr_data):
                 # 0
             # ), -1
         # )
+        
         nbr_data[ii]['edge_aux'] = torch.unsqueeze(
             torch.unsqueeze(
                 torch.tensor(nbr_data[ii]['edge_aux']).to(torch.float32),

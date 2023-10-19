@@ -139,7 +139,7 @@ class NbrAttn2(nn.Module):
         self.process_edge_aux1 = nn.Linear(edge_aux_channels, d_cross_attn)
         self.process_edge_aux2 = nn.Linear(d_cross_attn, d_cross_attn)
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(cfg.dropout)
+        self.dropout = nn.Dropout(dropout)
 
         self.sublayer = SublayerConnection(d_cross_attn, dropout)
         self.pe = PositionalEncoding(d_cross_attn, dropout)
@@ -155,9 +155,9 @@ class NbrAttn2(nn.Module):
                 x_b = x[b:(b+1)]
                 
                 # create dummies for accumulating neighbours
-                nbr_attn_keys = torch.zeros((1, 0, x_b.shape[2])) # requires grad = True?
-                nbr_attn_values = torch.zeros((1, 0, x_b.shape[2])) # requires grad = True?
-                nbr_attn_masks = torch.zeros((1, x_b.shape[1], 0)) # requires grad = True?
+                nbr_attn_keys = torch.zeros((1, 0, x_b.shape[2])).to(x.device) # requires grad = True?
+                nbr_attn_values = torch.zeros((1, 0, x_b.shape[2])).to(x.device) # requires grad = True?
+                nbr_attn_masks = torch.zeros((1, x_b.shape[1], 0)).to(x.device) # requires grad = True?
                 
                 # do we want to do positional encoding of x_b?
                 # (might be "double counting" PE from self attention?)
@@ -199,8 +199,8 @@ class NbrAttn2(nn.Module):
                     nbr_attn_masks = torch.cat([nbr_attn_masks, this_nbr['attention_mask']], dim=-1)                    
                                             
                 # calculate cross-attention over nbr timeseries                    
-                x_attn = sublayer(x_b, 
-                    lambda x_b: cross_attn(x_b,
+                x_attn = self.sublayer(x_b, 
+                    lambda x_b: self.cross_attn(x_b,
                                            nbr_attn_keys,
                                            nbr_attn_values,
                                            nbr_attn_masks)
@@ -258,10 +258,15 @@ class NbrAttnGapFill(nn.Module):
         self.embed_for_precip = nn.Linear(model_size, cfg.precip_embed)
         
         # prediction        
-        self.pred1 = nn.Linear(model_size, cfg.features_d * 2) # as we output features not density
-        self.pred2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2 - 1) # as we output features - precip
-        self.pred_precip1 = nn.Linear(cfg.precip_embed, cfg.precip_embed//2) # as we output features not density
-        self.pred_precip2 = nn.Linear(cfg.precip_embed//2, 1) # as we output features - precip
+        self.pred1 = nn.Linear(model_size, cfg.features_d * 2)
+        self.pred2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2 - 1) # as we output features (not density) - precip
+        self.logsig1 = nn.Linear(model_size, cfg.features_d * 2)
+        self.logsig2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2 - 1) # log sigma
+
+        self.pred_precip1 = nn.Linear(cfg.precip_embed, cfg.precip_embed//2)
+        self.pred_precip2 = nn.Linear(cfg.precip_embed//2, 1)
+        self.logsig_precip1 = nn.Linear(cfg.precip_embed, cfg.precip_embed//2)
+        self.logsig_precip2 = nn.Linear(cfg.precip_embed//2, 1)
 
     def forward(self, x_in, aux_in, precip_nbr_data=None, allvar_nbr_data=None):
         """
@@ -300,14 +305,24 @@ class NbrAttnGapFill(nn.Module):
         x_allvar = self.allvar_nbr_attn(x, allvar_nbr_data)
                             
         # predict
-        x_allvar = self.pred1(x_allvar)
-        x_allvar = self.pred2(x_allvar)
-        x_precip = self.pred_precip1(x_precip)
-        x_precip = self.pred_precip2(x_precip)
-        """
-        Also output error estimates?
-        """
-        return x_allvar.transpose(1,2), x_precip.transpose(1,2) # (B, C, L)
+        pred_allvar = self.pred1(x_allvar)
+        pred_allvar = self.pred2(pred_allvar)
+        
+        pred_precip = self.pred_precip1(x_precip)
+        pred_precip = self.pred_precip2(pred_precip)
+        
+        logsig_allvar = self.logsig1(x_allvar)
+        logsig_allvar = self.logsig2(logsig_allvar)
+        
+        logsig_precip = self.logsig_precip1(x_precip)
+        logsig_precip = self.logsig_precip2(logsig_precip)
+        
+        # return as (B, C, L)
+        return (pred_allvar.transpose(1,2),
+                logsig_allvar.transpose(1,2),
+                pred_precip.transpose(1,2),
+                logsig_precip.transpose(1,2))
+        
 
 
 class AttnGapFill(nn.Module):
