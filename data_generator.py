@@ -186,9 +186,30 @@ def load_cloud_cover(time_dat, lat, lon):
     ).iloc[1:-1] # trim off extra time points
     return tcc
 
+def extract_ireland_shetland_sites(site_meta):
+    lat_up = 55.3
+    lat_down = 53.0
+    lon_right = -5.4
+    lon_left = -8.3        
+    ireland_sites = site_meta[
+        ((site_meta['LATITUDE']>lat_down) & 
+         (site_meta['LATITUDE']<lat_up) &
+         (site_meta['LONGITUDE']>lon_left) &
+         (site_meta['LONGITUDE']<lon_right))
+    ]
+    shetland_sites = site_meta[site_meta['LATITUDE']>59.5]
+    return pd.concat([ireland_sites, shetland_sites], axis=0)    
+    
+
 class gap_generator():
     def __init__(self):
         self.metadata = CosmosMetaData()
+        
+        ''' we need to remove the Ireland / Shetland sites as we 
+        don't have the ancillary data for them currently '''
+        rm_sites = extract_ireland_shetland_sites(self.metadata.site)
+        self.metadata.site = self.metadata.site[~self.metadata.site['SITE_ID'].isin(rm_sites['SITE_ID'])]
+        
         self.val_sites = self.metadata.site.sample(frac=0.33, random_state=2)['SITE_ID']
         self.sites = self.metadata.site[~self.metadata.site.index.isin(self.val_sites.index)]['SITE_ID']        
         self.use_vars = ['WS', 'LWIN', 'PA', 'PRECIP', 'RH', 'SWIN', 'TA']
@@ -197,9 +218,28 @@ class gap_generator():
         self.spt = SolarPositionTemporal(timezone=0)
         self.use_clouds = False
         self.site_data = {}
+        
         self.ea_site_info = get_EA_gauge_info()
-        self.attach_bng_coords()
+        rm_sites = extract_ireland_shetland_sites(self.ea_site_info)
+        self.ea_site_info = self.ea_site_info[~self.ea_site_info['SITE_ID'].isin(rm_sites['SITE_ID'])]
+        
+        self.attach_bng_coords() # to site metadata        
+        
         self.topography = xr.open_dataset(chess_ancil_dir + 'uk_ihdtm_topography+topoindex_1km.nc').load()
+        
+        ## treat NaNs (i.e. water) in height grid        
+        # 1: elev, sea NaNs should be elev==0        
+        self.topography.elev.values[np.isnan(self.topography.elev.values)] = 0
+        # 2: stdev, sea NaNs should be stdev==0        
+        self.topography.stdev.values[np.isnan(self.topography.stdev.values)] = 0
+        # 3: slope, sea NaNs should be slope==0
+        self.topography.slope.values[np.isnan(self.topography.slope.values)] = 0
+        # 4: aspect, sea NaNs are tricky, aspect is "straight up", stick with uniform noise
+        asp_mask = np.isnan(self.topography.aspect.values)
+        self.topography.aspect.values[asp_mask] =  np.random.uniform(
+            low=0, high=360, size=len(np.where(asp_mask)[0])
+        )
+        
     
     def attach_bng_coords(self):
         latlon_ref = xr.open_dataset(chess_ancil_dir + 'chess_lat_lon.nc').load()

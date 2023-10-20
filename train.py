@@ -61,6 +61,10 @@ if __name__=="__main__":
     
     #cfg.lr = 1e-6
     
+    ''' first we freeze old model to train nbr attn and prediction layers
+        but then we should unfreeze all layers and fine tune with low
+        learning rate to create final model?
+    '''
     # create optimizer and load checkpoint
     if load_old_model:
         old_model, _, _ = setup_checkpoint(
