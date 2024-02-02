@@ -12,7 +12,7 @@ from torch.optim import Adam
 from pathlib import Path
 
 from params import model_cfg as cfg
-from architectures.gap_fill_attn import AttnGapFill, NbrAttnGapFill#, PureAuxPred
+from architectures.gap_fill_attn import PureAuxPred
 from data_generator import gap_generator
 from utils import *
 
@@ -23,20 +23,14 @@ if __name__=="__main__":
     max_epochs = 1000
     train_batches_per_epoch = 400
     val_batches_per_epoch = 150
-    load_old_model = False
     
     log_dir = '/home/users/doran/projects/infilling/logs/'
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    
-    #model_name = 'aux_infill'
-    if load_old_model:
-        # old model to load early layers from
-        old_model_name = 'infill'    
-        old_model_outdir = f'{log_dir}/{old_model_name}/'    
-        Path(old_model_outdir).mkdir(parents=True, exist_ok=True)    
-        old_specify_chkpnt = f'{old_model_name}/checkpoint.pth' # if None, load best, otherwise "modelname/checkpoint.pth"
-        
-    model_name = 'infill_nbrattn'
+
+    precip = False
+    use_nbrs = False
+    sep_precip_branch = False
+    model_name = f'infill_aux_p{precip}'
     model_outdir = f'{log_dir}/{model_name}/'    
     Path(model_outdir).mkdir(parents=True, exist_ok=True)    
     specify_chkpnt = f'{model_name}/checkpoint.pth' # if None, load best, otherwise "modelname/checkpoint.pth"
@@ -49,77 +43,33 @@ if __name__=="__main__":
     logprob_vargap_seq = np.linspace(-2,-0.5,max_epochs)
     
     # create data generator and model
-    dg = gap_generator()
+    dg = gap_generator(precip=precip, use_nbrs=use_nbrs)
+    cfg.features_d = 2 * len(dg.use_vars)
     
-    #model = PureAuxPred(cfg)
-    if load_old_model:
-        old_model = AttnGapFill(cfg)
-        old_model.to(device)
-        
-    model = NbrAttnGapFill(cfg)
+    model = PureAuxPred(cfg)
     model.to(device)
     
-    #cfg.lr = 1e-6
-    
-    ''' first we freeze old model to train nbr attn and prediction layers
-        but then we should unfreeze all layers and fine tune with low
-        learning rate to create final model?
-    '''
     # create optimizer and load checkpoint
-    if load_old_model:
-        old_model, _, _ = setup_checkpoint(
-            old_model, None, device, load_prev_chkpnt,
-            old_model_outdir, log_dir,
-            specify_chkpnt=specify_chkpnt,
-            reset_chkpnt=reset_chkpnt
-        )
-        old_model_state = old_model.state_dict()
-        # remove same-named predict layers
-        samename = ['pred1.weight', 'pred1.bias', 'pred2.weight', 'pred2.bias']
-        for sm in samename: old_model_state.pop(sm)
-        
-        model.load_state_dict(old_model_state, strict=False)
-        
-        # freeze layers before neighbour attention
-        for param in model.parameters():
-            param.requires_grad = False
-        # unfreeze only layers we want to train
-        model.allvar_nbr_attn.requires_grad_(True)
-        model.precip_nbr_attn.requires_grad_(True)
-        model.embed_for_precip.requires_grad_(True)
-        model.pred1.requires_grad_(True)
-        model.pred2.requires_grad_(True)
-        model.pred_precip1.requires_grad_(True)
-        model.pred_precip2.requires_grad_(True)
-        model.logsig1.requires_grad_(True)
-        model.logsig2.requires_grad_(True)
-        model.logsig_precip1.requires_grad_(True)
-        model.logsig_precip2.requires_grad_(True)
-        
-        optimizer = Adam(model.parameters(), lr=cfg.lr)
-        checkpoint = None
-    else:
-        optimizer = Adam(model.parameters(), lr=cfg.lr)
-        model, optimizer, checkpoint = setup_checkpoint(
-            model, optimizer, device, load_prev_chkpnt,
-            model_outdir, log_dir,
-            specify_chkpnt=specify_chkpnt,
-            reset_chkpnt=reset_chkpnt
-        )
-        
-    # loss_func = make_loss_func(weight_gaps=5,
-                               # use_non_gaps=True,
-                               # enforce_gap_endpoints=True,
-                               # weight_endpoints=1
-    # )
-    loss_func = make_nll_loss(
-        weight_gaps=5,
-        use_non_gaps=True,
-        enforce_gap_endpoints=True,
-        weight_endpoints=1
+    optimizer = Adam(model.parameters(), lr=cfg.lr)
+    
+    model, optimizer, checkpoint = setup_checkpoint(
+        model, optimizer, device, load_prev_chkpnt,
+        model_outdir, log_dir,
+        specify_chkpnt=specify_chkpnt,
+        reset_chkpnt=reset_chkpnt
     )
-    train_step = make_train_step(model, optimizer, loss_func)
-    val_step = make_val_step(model, loss_func)    
+    
+    # define loss function and create train steps
+    loss_func = make_nll_loss(
+        weight_gaps=1,
+        use_non_gaps=True,
+        enforce_gap_endpoints=False,
+        weight_endpoints=0
+    )
+    train_step = make_train_step(model, optimizer, loss_func,
+                                 sep_precip_branch=sep_precip_branch)
+    val_step = make_val_step(model, loss_func,
+                             sep_precip_branch=sep_precip_branch)    
     losses, val_losses, curr_epoch, best_loss = prepare_run(checkpoint)
         
     print("Trainable parameters: %d" % count_parameters(model))
@@ -139,22 +89,16 @@ if __name__=="__main__":
             longrange=cfg.longrange
         )
         batch = send_batch_to_device(batch, device)
-        
-        pred, logsig, p_pred, p_logsig = model(
+                
+        pred, logsig = model(
             batch['inputs'],
-            batch['aux_inputs'],
-            precip_nbr_data=batch['precip_nbrs'],
-            allvar_nbr_data=batch['allvar_nbrs']
+            batch['aux_inputs']
         )
-        loss = loss_func(pred, logsig, p_pred, p_logsig, batch)
+        loss = loss_func(pred, logsig, batch)            
         print(loss)
         
-        # join precip onto other vars
-        p_ind = batch['metadata'][0]['var_order'].index('PRECIP')
-        pred = torch.cat([pred[:,:p_ind,:], p_pred, pred[:,p_ind:,:]], dim=1)
-        sigma = torch.cat([logsig[:,:p_ind,:], p_logsig, logsig[:,p_ind:,:]], dim=1)
-        sigma = torch.exp(sigma)
-        
+        sigma = torch.exp(logsig)
+               
         plt.plot(checkpoint['losses'])
         plt.plot(checkpoint['val_losses'])
         plt.show()

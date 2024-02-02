@@ -12,6 +12,30 @@ from architectures.components.layer_norm import LayerNorm, SublayerConnection
 from architectures.components.positional_encoding import PositionalEncoding
 from architectures.components.nn_utils import subsequent_mask, clones
 
+class RNNEncoder(nn.Module):
+    def __init__(self, cfg):
+        super(RNNEncoder, self).__init__()
+
+        self.output_dim = cfg.output_dim
+        
+        # RNN
+        self.rnn_enc = nn.GRU(cfg.features_d, cfg.encode_dim)
+
+    def forward(self, batch):
+        
+        # RNN through the processed and packed sequence to create encoding
+        # x = pack_padded_sequence(
+            # batch['dynamic_in'].transpose(-2,-1), # (B, L, C)
+            # [bm['length'] for bm in batch['meta']], # seq_lens
+            # batch_first=True, 
+            # enforce_sorted=False
+        # )
+        _, encoding = self.rnn_enc(x)
+
+
+        return torch.exp(x_out.transpose(-2,-1)), encoding # (B, C, L)
+
+
 class PureAuxPred(nn.Module):
     def __init__(self, cfg):
         super(PureAuxPred, self).__init__()        
@@ -24,7 +48,11 @@ class PureAuxPred(nn.Module):
         self.pred1 = nn.Linear(cfg.embed_aux, cfg.features_aux * 2) # as we output features not density
         self.pred2 = nn.Linear(cfg.features_aux * 2, cfg.features_d // 2) # as we output features not density
         
-    def forward(self, x_in, aux_in):
+        self.logsig1 = nn.Linear(cfg.embed_aux, cfg.features_aux * 2)
+        self.logsig2 = nn.Linear(cfg.features_aux * 2, cfg.features_d // 2) # log sigma
+        
+        
+    def forward(self, x_in, aux_in, precip_nbr_data=None, allvar_nbr_data=None):
         aux = self.aux_embedding1(aux_in)
         xaux = self.gelu(aux)
         aux = self.dropout(aux)
@@ -34,9 +62,12 @@ class PureAuxPred(nn.Module):
         aux = self.dropout(aux)
 
         # predict
-        aux = self.pred1(aux.transpose(1,2)) # (B, L, C)
-        aux = self.pred2(aux)
-        return aux.transpose(1,2) # (B, C, L)
+        auxmu = self.pred1(aux.transpose(1,2)) # (B, L, C)
+        auxmu = self.pred2(auxmu)
+        
+        auxlogsig = self.logsig1(aux.transpose(1,2)) # (B, L, C)
+        auxlogsig = self.logsig2(auxlogsig)
+        return auxmu.transpose(1,2), auxlogsig.transpose(1,2) # (B, C, L)
 
 class AttentionBlock(nn.Module):
     def __init__(self, layer, N):
@@ -145,7 +176,9 @@ class NbrAttn2(nn.Module):
         self.pe = PositionalEncoding(d_cross_attn, dropout)
         self.cross_attn = MultiHeadedAttention(attn_heads, d_cross_attn)
         
-    def forward(self, x, nbr_data):                
+    def forward(self, x, nbr_data):
+        if nbr_data is None:
+            return x
         attn_out = []
         for b in range(len(nbr_data)): # loop over batches
             if len(nbr_data[b])==0: # no nbrs
@@ -212,7 +245,7 @@ class NbrAttn2(nn.Module):
 
 
 class NbrAttnGapFill(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, precip_branch=False):
         super(NbrAttnGapFill, self).__init__()
         """ cfg is a SimpleNameSpace containing:
             features_d: the number of features
@@ -222,6 +255,7 @@ class NbrAttnGapFill(nn.Module):
             Natt_l: number of attention layers per head
             d_ff: hidden dimension in feed forward layers
         """        
+        self.precip_branch = precip_branch
         # embedding
         self.initial_embedding1 = nn.Conv1d(cfg.features_d, cfg.embed_ds, kernel_size=1)
         self.initial_embedding2 = nn.Conv1d(cfg.embed_ds, cfg.embed_ds, kernel_size=1)
@@ -248,25 +282,32 @@ class NbrAttnGapFill(nn.Module):
             cfg.dropout
         )
         
-        self.precip_nbr_attn = NbrAttn2(
-            1, 1,
-            cfg.features_aux, cfg.embed_aux,
-            cfg.edge_aux_channels,
-            cfg.precip_embed, cfg.Natt_h_nbr,
-            cfg.dropout
-        )        
-        self.embed_for_precip = nn.Linear(model_size, cfg.precip_embed)
-        
-        # prediction        
-        self.pred1 = nn.Linear(model_size, cfg.features_d * 2)
-        self.pred2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2 - 1) # as we output features (not density) - precip
-        self.logsig1 = nn.Linear(model_size, cfg.features_d * 2)
-        self.logsig2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2 - 1) # log sigma
+        if self.precip_branch:
+            self.precip_nbr_attn = NbrAttn2(
+                1, 1,
+                cfg.features_aux, cfg.embed_aux,
+                cfg.edge_aux_channels,
+                cfg.precip_embed, cfg.Natt_h_nbr,
+                cfg.dropout
+            )        
+            self.embed_for_precip = nn.Linear(model_size, cfg.precip_embed)
+            
+            # prediction        
+            self.pred1 = nn.Linear(model_size, cfg.features_d * 2)
+            self.pred2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2 - 1) # as we output features (not density) - precip
+            self.logsig1 = nn.Linear(model_size, cfg.features_d * 2)
+            self.logsig2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2 - 1) # log sigma
 
-        self.pred_precip1 = nn.Linear(cfg.precip_embed, cfg.precip_embed//2)
-        self.pred_precip2 = nn.Linear(cfg.precip_embed//2, 1)
-        self.logsig_precip1 = nn.Linear(cfg.precip_embed, cfg.precip_embed//2)
-        self.logsig_precip2 = nn.Linear(cfg.precip_embed//2, 1)
+            self.pred_precip1 = nn.Linear(cfg.precip_embed, cfg.precip_embed//2)
+            self.pred_precip2 = nn.Linear(cfg.precip_embed//2, 1)
+            self.logsig_precip1 = nn.Linear(cfg.precip_embed, cfg.precip_embed//2)
+            self.logsig_precip2 = nn.Linear(cfg.precip_embed//2, 1)
+
+        else:
+            self.pred1 = nn.Linear(model_size, cfg.features_d * 2)
+            self.pred2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2) # as we output features (not density channel) - precip
+            self.logsig1 = nn.Linear(model_size, cfg.features_d * 2)
+            self.logsig2 = nn.Linear(cfg.features_d * 2, cfg.features_d // 2) # log sigma
 
     def forward(self, x_in, aux_in, precip_nbr_data=None, allvar_nbr_data=None):
         """
@@ -298,31 +339,41 @@ class NbrAttnGapFill(nn.Module):
         # self attention across time series        
         x = self.attblck(x)
         
-        # optional neighbour attentions, split precip from other vars
-        x_precip = self.embed_for_precip(x)
-        x_precip = self.precip_nbr_attn(x_precip, precip_nbr_data)
-        
-        x_allvar = self.allvar_nbr_attn(x, allvar_nbr_data)
+        if self.precip_branch:
+            # optional neighbour attentions, split precip from other vars
+            x_precip = self.embed_for_precip(x)
+            x_precip = self.precip_nbr_attn(x_precip, precip_nbr_data)            
+            x_allvar = self.allvar_nbr_attn(x, allvar_nbr_data)
                             
-        # predict
-        pred_allvar = self.pred1(x_allvar)
-        pred_allvar = self.pred2(pred_allvar)
+            # predict
+            pred_allvar = self.pred1(x_allvar)
+            pred_allvar = self.pred2(pred_allvar)
+            
+            pred_precip = self.pred_precip1(x_precip)
+            pred_precip = self.pred_precip2(pred_precip)
+            
+            logsig_allvar = self.logsig1(x_allvar)
+            logsig_allvar = self.logsig2(logsig_allvar)
+            
+            logsig_precip = self.logsig_precip1(x_precip)
+            logsig_precip = self.logsig_precip2(logsig_precip)
         
-        pred_precip = self.pred_precip1(x_precip)
-        pred_precip = self.pred_precip2(pred_precip)
-        
-        logsig_allvar = self.logsig1(x_allvar)
-        logsig_allvar = self.logsig2(logsig_allvar)
-        
-        logsig_precip = self.logsig_precip1(x_precip)
-        logsig_precip = self.logsig_precip2(logsig_precip)
-        
-        # return as (B, C, L)
-        return (pred_allvar.transpose(1,2),
-                logsig_allvar.transpose(1,2),
-                pred_precip.transpose(1,2),
-                logsig_precip.transpose(1,2))
-        
+            # return as (B, C, L)
+            return (pred_allvar.transpose(1,2),
+                    logsig_allvar.transpose(1,2),
+                    pred_precip.transpose(1,2),
+                    logsig_precip.transpose(1,2))
+        else:
+            x = self.allvar_nbr_attn(x, allvar_nbr_data)
+                            
+            # predict
+            pred = self.pred1(x)
+            pred = self.pred2(pred)
+            logsig = self.logsig1(x)
+            logsig = self.logsig2(logsig)   
+            
+            # return as (B, C, L)
+            return pred.transpose(1,2), logsig.transpose(1,2)
 
 
 class AttnGapFill(nn.Module):

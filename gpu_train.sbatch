@@ -6,7 +6,8 @@
 #SBATCH -o %A_%a.out
 #SBATCH -e %A_%a.err
 #SBATCH --time=24:00:00
-#SBATCH --mem=8000
+#SBATCH --mem=10000
 
 source /home/users/doran/software/envs/pytorch/bin/activate
-python ./train.py
+#python ./train_simple.py
+python ./latent_model.py

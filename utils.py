@@ -34,21 +34,26 @@ def init_bearing(lat1, lon1, lat2, lon2):
         np.cos(np.deg2rad(lon2 - lon1))
     )
 
-def make_train_step(model, optimizer, loss_func, stop_on_nan=True):
+def make_train_step(model, optimizer, loss_func, stop_on_nan=True, sep_precip_branch=False):
     def train_step(batch):
         model.train()
         
-        ## old
-        # pred = model(batch['inputs'], batch['aux_inputs'])
-        # loss = loss_func(pred, batch)
-        
-        pred, logsig, p_pred, p_logsig = model(
-            batch['inputs'],
-            batch['aux_inputs'],
-            precip_nbr_data=batch['precip_nbrs'],
-            allvar_nbr_data=batch['allvar_nbrs']
-        )
-        loss = loss_func(pred, logsig, p_pred, p_logsig, batch)
+        if sep_precip_branch:
+            pred, logsig, p_pred, p_logsig = model(
+                batch['inputs'],
+                batch['aux_inputs'],
+                precip_nbr_data=batch['precip_nbrs'],
+                allvar_nbr_data=batch['allvar_nbrs']
+            )
+            loss = loss_func(pred, logsig, batch,
+                             p_pred=p_pred, p_logsig=p_logsig)
+        else:
+            pred, logsig = model(
+                batch['inputs'],
+                batch['aux_inputs'],
+                allvar_nbr_data=batch['allvar_nbrs']
+             )
+            loss = loss_func(pred, logsig, batch)
         
         if stop_on_nan:
             if np.isnan(loss.item()):
@@ -60,21 +65,26 @@ def make_train_step(model, optimizer, loss_func, stop_on_nan=True):
         return loss.item()
     return train_step
 
-def make_val_step(model, loss_func, stop_on_nan=True):
+def make_val_step(model, loss_func, stop_on_nan=True, sep_precip_branch=False):
     def val_step(batch):
         model.eval()
         
-        ## old
-        # pred = model(batch['inputs'], batch['aux_inputs'])
-        # loss = loss_func(pred, batch)
-        
-        pred, logsig, p_pred, p_logsig = model(
-            batch['inputs'],
-            batch['aux_inputs'],
-            precip_nbr_data=batch['precip_nbrs'],
-            allvar_nbr_data=batch['allvar_nbrs']
-        )
-        loss = loss_func(pred, logsig, p_pred, p_logsig, batch)
+        if sep_precip_branch:
+            pred, logsig, p_pred, p_logsig = model(
+                batch['inputs'],
+                batch['aux_inputs'],
+                precip_nbr_data=batch['precip_nbrs'],
+                allvar_nbr_data=batch['allvar_nbrs']
+            )
+            loss = loss_func(pred, logsig, batch,
+                             p_pred=p_pred, p_logsig=p_logsig)
+        else:
+            pred, logsig = model(
+                batch['inputs'],
+                batch['aux_inputs'],
+                allvar_nbr_data=batch['allvar_nbrs']
+             )
+            loss = loss_func(pred, logsig, batch)
         
         if stop_on_nan:
             if np.isnan(loss.item()):
@@ -82,8 +92,6 @@ def make_val_step(model, loss_func, stop_on_nan=True):
         
         return loss.item()
     return val_step
-    
-    
 
 def make_loss_func(weight_gaps=1., use_non_gaps=False,
                    enforce_gap_endpoints=True, weight_endpoints=1.):
@@ -114,23 +122,26 @@ def make_loss_func(weight_gaps=1., use_non_gaps=False,
     return gap_mse_loss
 
 def normal_loglikelihood(mu, x, sigma):
-    return 0.5 * ((x - mu)/(sigma + EPS)) * ((x - mu)/(sigma + EPS)) + torch.log(sigma * SQRT2PI + EPS)
+    return -0.5 * ((x - mu)/(sigma + EPS)) * ((x - mu)/(sigma + EPS)) - torch.log(sigma * SQRT2PI + EPS)
 
-def make_nll_loss(weight_gaps=1., use_non_gaps=False,
+def make_nll_loss(weight_gaps=1., use_non_gaps=False, reg_sigma=1.,
                   enforce_gap_endpoints=True, weight_endpoints=1.):
     
-    def gap_nll_loss(pred, logsig, p_pred, p_logsig, batch):
-        p_ind = batch['metadata'][0]['var_order'].index('PRECIP')
-        pred = torch.cat([pred[:,:p_ind,:], p_pred, pred[:,p_ind:,:]], dim=1)
-        sigma = torch.cat([logsig[:,:p_ind,:], p_logsig, logsig[:,p_ind:,:]], dim=1)
-        sigma = torch.exp(sigma)
+    def gap_nll_loss(pred, logsig, batch, p_pred=None, p_logsig=None):
+        if not p_pred is None:
+            p_ind = batch['metadata'][0]['var_order'].index('PRECIP')
+            pred = torch.cat([pred[:,:p_ind,:], p_pred, pred[:,p_ind:,:]], dim=1)
+            logsig = torch.cat([logsig[:,:p_ind,:], p_logsig, logsig[:,p_ind:,:]], dim=1)
+        
+        sigma = torch.exp(logsig)
         
         fake_gap_mask = (batch['our_gaps'])*(~batch['existing_gaps'])
-        gap_loss = weight_gaps * normal_loglikelihood(
+        gap_loss = -weight_gaps * normal_loglikelihood(
             batch['targets'][fake_gap_mask],
             pred[fake_gap_mask],
             sigma[fake_gap_mask]
         ).mean()
+        gap_loss += reg_sigma * sigma.mean() # regularization
         
         if enforce_gap_endpoints:
             endpoint_loss = gap_loss * 0
@@ -142,7 +153,7 @@ def make_nll_loss(weight_gaps=1., use_non_gaps=False,
                     if batch['metadata'][b]['tot_our_gaps'][var]>0:
                         gap_inds = torch.where(batch['our_gaps'][b,ii,:])[0]
                         if (gap_inds[0]-1)>=0 and not batch['existing_gaps'][b,ii,gap_inds[0]-1]:
-                            endpoint_loss += normal_loglikelihood(
+                            endpoint_loss -= normal_loglikelihood(
                                 batch['targets'][b,ii,gap_inds[0]-1],
                                 pred[b,ii,gap_inds[0]-1],
                                 sigma[b,ii,gap_inds[0]-1]
@@ -150,7 +161,7 @@ def make_nll_loss(weight_gaps=1., use_non_gaps=False,
                             num += 1
                         if ((gap_inds[0]+1)<len(batch['our_gaps'][b,ii,:]) and 
                             not batch['existing_gaps'][b,ii,gap_inds[0]+1]):
-                            endpoint_loss += normal_loglikelihood(
+                            endpoint_loss -= normal_loglikelihood(
                                 batch['targets'][b,ii,gap_inds[0]+1],
                                 pred[b,ii,gap_inds[0]+1],
                                 sigma[b,ii,gap_inds[0]+1]
@@ -259,21 +270,89 @@ def send_batch_to_device(batch, device):
     if 'allvar_nbrs' in batch.keys():
         allvar_nbrs = batch.pop('allvar_nbrs')
         av_nbrs = True
+    
     # send easy tensors to device
     batch = {k : batch[k].to(device) for k in batch.keys()}
     batch['metadata'] = meta
+    
     # deal with nbr dicts
     nbr_arrs = ['masked_data', 'attention_mask', 'node_aux', 'edge_aux']
     if p_nbrs:
-        for ii in range(len(precip_nbrs)):
-            for n in range(len(precip_nbrs[ii])):
-                for arr in nbr_arrs:
-                    precip_nbrs[ii][n][arr] = precip_nbrs[ii][n][arr].to(device)
-        batch['precip_nbrs'] = precip_nbrs
+        if precip_nbrs is None:
+            batch['precip_nbrs'] = None
+        else:            
+            for ii in range(len(precip_nbrs)):
+                for n in range(len(precip_nbrs[ii])):
+                    for arr in nbr_arrs:
+                        precip_nbrs[ii][n][arr] = precip_nbrs[ii][n][arr].to(device)
+            batch['precip_nbrs'] = precip_nbrs
     if av_nbrs:
-        for ii in range(len(allvar_nbrs)):
-            for n in range(len(allvar_nbrs[ii])):
-                for arr in nbr_arrs:
-                    allvar_nbrs[ii][n][arr] = allvar_nbrs[ii][n][arr].to(device)    
-        batch['allvar_nbrs'] = allvar_nbrs    
+        if allvar_nbrs is None:
+            batch['allvar_nbrs'] = None
+        else:
+            for ii in range(len(allvar_nbrs)):
+                for n in range(len(allvar_nbrs[ii])):
+                    for arr in nbr_arrs:
+                        allvar_nbrs[ii][n][arr] = allvar_nbrs[ii][n][arr].to(device)    
+            batch['allvar_nbrs'] = allvar_nbrs    
     return batch
+
+
+def make_rnnvae_train_step(model, optimizer,
+                           stop_on_nan=True,
+                           use_latent_mean=False,
+                           ensemble_size=5):
+    
+    def train_step(batch):
+        model.train()
+        
+        out = model(
+            batch,
+            use_latent_mean=use_latent_mean,
+            calc_elbo=True,
+            ensemble_size=ensemble_size
+        )
+        # out.keys(): ['pred_mu', 'pred_sigma', 'pred_ensemble', 'nll', 'kl', 'ELBO']
+        
+        # normalise by batch size * sequence length
+        neg_elbo_mean = -out['ELBO'] / (batch['inputs'].shape[0] * batch['inputs'].shape[2])
+        
+        if stop_on_nan:
+            if np.isnan(neg_elbo_mean.item()):
+                return 'STOP'
+        
+        neg_elbo_mean.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        out['neg_elbo_mean'] = neg_elbo_mean
+        return out
+        
+    return train_step
+
+def make_rnnvae_val_step(model,
+                         stop_on_nan=True,
+                         use_latent_mean=False,
+                         ensemble_size=5):
+    
+    def val_step(batch):
+        model.eval()
+        
+        out = model(
+            batch,
+            use_latent_mean=use_latent_mean,
+            calc_elbo=True,
+            ensemble_size=ensemble_size
+        )
+        # out.keys(): ['pred_mu', 'pred_sigma', 'pred_ensemble', 'nll', 'kl', 'ELBO']
+        
+        # normalise by batch size * sequence length
+        neg_elbo_mean = -out['ELBO'] / (batch['inputs'].shape[0] * batch['inputs'].shape[2])
+        
+        if stop_on_nan:
+            if np.isnan(neg_elbo_mean.item()):
+                return 'STOP'
+        
+        out['neg_elbo_mean'] = neg_elbo_mean
+        return out
+    return val_step

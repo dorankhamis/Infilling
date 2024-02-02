@@ -200,9 +200,39 @@ def extract_ireland_shetland_sites(site_meta):
     shetland_sites = site_meta[site_meta['LATITUDE']>59.5]
     return pd.concat([ireland_sites, shetland_sites], axis=0)    
     
+def process_precip_nbr_data(precip_nbr_data, data):
+    for i in range(len(precip_nbr_data)):
+        precip_nbr_data[i]['real_gap_masks'] = create_real_gap_masks(precip_nbr_data[i]['timeseries'])
+        precip_nbr_data[i]['masked_data'] = insert_gaps(precip_nbr_data[i]['timeseries'],
+                                                        gap_masks=None,
+                                                        real_gap_masks=precip_nbr_data[i]['real_gap_masks'])        
+        # for single-variable precip timeseries we don't need
+        # to input the 0/1 mask flags as we will be masking all the
+        # missing times anyway, so just select PRECIP
+        precip_nbr_data[i]['masked_data'] = precip_nbr_data[i]['masked_data'][['PRECIP']]
+        
+        # create attention mask
+        precip_nbr_data[i]['attention_mask'] = np.ones((data.shape[0], precip_nbr_data[i]['timeseries'].shape[0]), dtype=bool)
+        mask_inds = np.where(np.stack([precip_nbr_data[i]['real_gap_masks'][v] for v in ['PRECIP']], axis=0).sum(axis=0) == 1)[0]
+        precip_nbr_data[i]['attention_mask'][:,mask_inds] = False
+    return precip_nbr_data
+
+def process_nonprecip_nbr_data(allvar_nbr_data, data):
+    for i in range(len(allvar_nbr_data)):
+        allvar_nbr_data[i]['real_gap_masks'] = create_real_gap_masks(allvar_nbr_data[i]['timeseries'])
+        allvar_nbr_data[i]['masked_data'] = insert_gaps(allvar_nbr_data[i]['timeseries'],
+                                                        gap_masks=None,
+                                                        real_gap_masks=allvar_nbr_data[i]['real_gap_masks'])
+        allvar_nbr_data[i]['masked_data'] = allvar_nbr_data[i]['masked_data'][allvar_nbr_data[i]['masked_data'].columns.sort_values()]
+        
+        # create attention mask
+        allvar_nbr_data[i]['attention_mask'] = np.ones((data.shape[0], allvar_nbr_data[i]['timeseries'].shape[0]), dtype=bool)
+        mask_inds = np.where(np.stack([allvar_nbr_data[i]['real_gap_masks'][v] for v in data.columns], axis=0).sum(axis=0) == len(data.columns))[0]
+        allvar_nbr_data[i]['attention_mask'][:,mask_inds] = False
+    return allvar_nbr_data
 
 class gap_generator():
-    def __init__(self):
+    def __init__(self, precip=False, use_nbrs=False):
         self.metadata = CosmosMetaData()
         
         ''' we need to remove the Ireland / Shetland sites as we 
@@ -211,13 +241,19 @@ class gap_generator():
         self.metadata.site = self.metadata.site[~self.metadata.site['SITE_ID'].isin(rm_sites['SITE_ID'])]
         
         self.val_sites = self.metadata.site.sample(frac=0.33, random_state=2)['SITE_ID']
-        self.sites = self.metadata.site[~self.metadata.site.index.isin(self.val_sites.index)]['SITE_ID']        
-        self.use_vars = ['WS', 'LWIN', 'PA', 'PRECIP', 'RH', 'SWIN', 'TA']
+        self.sites = self.metadata.site[~self.metadata.site.index.isin(self.val_sites.index)]['SITE_ID']
+        if precip:      
+            self.use_vars = ['PRECIP']
+        else:
+            self.use_vars = ['WS', 'LWIN', 'PA', 'RH', 'SWIN', 'TA']
         self.max_period = 250
         self.min_period = 1
         self.spt = SolarPositionTemporal(timezone=0)
         self.use_clouds = False
         self.site_data = {}
+        self.precip = precip
+        self.use_nbrs = use_nbrs
+        
         
         self.ea_site_info = get_EA_gauge_info()
         rm_sites = extract_ireland_shetland_sites(self.ea_site_info)
@@ -240,7 +276,6 @@ class gap_generator():
             low=0, high=360, size=len(np.where(asp_mask)[0])
         )
         
-    
     def attach_bng_coords(self):
         latlon_ref = xr.open_dataset(chess_ancil_dir + 'chess_lat_lon.nc').load()
         ys = []
@@ -267,132 +302,142 @@ class gap_generator():
         latlon_ref.close()        
     
     def connect_to_neighbours(self, SID, shortrange=10, longrange=60):
-        ## for precip (short distance)
-        targ = self.metadata.site[self.metadata.site['SITE_ID']==SID][['northing','easting']]
-        nbrs = NearestNeighbors().fit(self.ea_site_info[self.ea_site_info['SITE_ID']!=SID][['northing','easting']])
-        dis_ea, ids_ea = nbrs.radius_neighbors(targ, radius=shortrange)
-        sub_ea = self.ea_site_info.iloc[ids_ea[0]]
-        
-        nbrs = NearestNeighbors().fit(self.metadata.site[self.metadata.site['SITE_ID']!=SID][['northing','easting']])
-        dis_cos, ids_cos = nbrs.radius_neighbors(targ, radius=shortrange)
-        sub_cos = self.metadata.site.iloc[ids_cos[0]]
-        
-        ## for other vars (long distance)
-        nbrs = NearestNeighbors().fit(self.metadata.site[self.metadata.site['SITE_ID']!=SID][['northing','easting']])
-        dis_v_cos, ids_v_cos = nbrs.radius_neighbors(targ, radius=longrange)
-        sub_cos_othervars = self.metadata.site.iloc[ids_v_cos[0]]
-        return {'precip_nbrs':{'EA':sub_ea, 'COSMOS':sub_cos}, 'other_nbrs':{'COSMOS':sub_cos_othervars}}
+        if self.precip:
+            ## for precip (short distance)
+            targ = self.metadata.site[self.metadata.site['SITE_ID']==SID][['northing','easting']]
+            nbrs = NearestNeighbors().fit(self.ea_site_info[self.ea_site_info['SITE_ID']!=SID][['northing','easting']])
+            dis_ea, ids_ea = nbrs.radius_neighbors(targ, radius=shortrange)
+            sub_ea = self.ea_site_info.iloc[ids_ea[0]]
+            
+            nbrs = NearestNeighbors().fit(self.metadata.site[self.metadata.site['SITE_ID']!=SID][['northing','easting']])
+            dis_cos, ids_cos = nbrs.radius_neighbors(targ, radius=shortrange)
+            sub_cos = self.metadata.site.iloc[ids_cos[0]]
+        else:
+            ## for other vars (long distance)
+            nbrs = NearestNeighbors().fit(self.metadata.site[self.metadata.site['SITE_ID']!=SID][['northing','easting']])
+            dis_v_cos, ids_v_cos = nbrs.radius_neighbors(targ, radius=longrange)
+            #sub_cos_othervars = self.metadata.site.iloc[ids_v_cos[0]]
+            sub_cos = self.metadata.site.iloc[ids_v_cos[0]]
+            sub_ea = None
+        #return {'precip_nbrs':{'EA':sub_ea, 'COSMOS':sub_cos}, 'other_nbrs':{'COSMOS':sub_cos_othervars}}
+        return {'EA':sub_ea, 'COSMOS':sub_cos}
     
     def extract_neighbour_data(self, nbr_dict, home_data, SID):
         home_meta = self.metadata.site[self.metadata.site['SITE_ID']==SID]
         
-        ## precip neighbours
-        precip_nbr_data = []
-        for sid in nbr_dict['precip_nbrs']['EA'].SITE_ID:
-            ## get time series data
-            try:
-                sdat = pd.read_csv(f'{ea_dir}/data_15min/{sid}.csv')
-            except:
-                continue        
-                
-            sdat['DATE_TIME'] = pd.to_datetime(sdat['DATE_TIME'], format='%Y-%m-%d %H:%M:%S', utc=True)
-            sdat = (sdat.set_index('DATE_TIME')
-                .rename({'PRECIPITATION':'PRECIP'}, axis=1)
-                .resample('30T')
-                .sum()
-            )
-            # trim to desired period, keeping NaNs for missing times
-            sdat = (home_data.reset_index()[['DATE_TIME']]
-                .merge(sdat.reset_index(), how='left', on='DATE_TIME')
-                .set_index('DATE_TIME')
-            )
+        if self.precip:
+            ## precip neighbours
+            precip_nbr_data = []
+            #for sid in nbr_dict['precip_nbrs']['EA'].SITE_ID:
+            for sid in nbr_dict['EA'].SITE_ID:
+                ## get time series data
+                try:
+                    sdat = pd.read_csv(f'{ea_dir}/data_15min/{sid}.csv')
+                except:
+                    continue        
+                    
+                sdat['DATE_TIME'] = pd.to_datetime(sdat['DATE_TIME'], format='%Y-%m-%d %H:%M:%S', utc=True)
+                sdat = (sdat.set_index('DATE_TIME')
+                    .rename({'PRECIPITATION':'PRECIP'}, axis=1)
+                    .resample('30T')
+                    .sum()
+                )
+                # trim to desired period, keeping NaNs for missing times
+                sdat = (home_data.reset_index()[['DATE_TIME']]
+                    .merge(sdat.reset_index(), how='left', on='DATE_TIME')
+                    .set_index('DATE_TIME')
+                )
 
-            # if there is no data at the nbr node, skip
-            if sdat.dropna().shape[0]==0:
-                continue
+                # if there is no data at the nbr node, skip
+                if sdat.dropna().shape[0]==0:
+                    continue
+                    
+                precip_nbr_data.append({'site_id':sid})        
+                precip_nbr_data[-1]['timeseries'] = sdat
                 
-            precip_nbr_data.append({'site_id':sid})        
-            precip_nbr_data[-1]['timeseries'] = sdat
-            
-            ## get nbr node and connecting edge metadata        
-            node_aux, edge_aux = self.get_node_and_edge_aux_data(
-                sdat,
-                nbr_dict['precip_nbrs']['EA'],
-                home_meta,
-                sid
-            )
-            precip_nbr_data[-1]['node_aux'] = node_aux
-            precip_nbr_data[-1]['edge_aux'] = edge_aux            
+                ## get nbr node and connecting edge metadata        
+                node_aux, edge_aux = self.get_node_and_edge_aux_data(
+                    sdat,
+                    nbr_dict['precip_nbrs']['EA'],
+                    home_meta,
+                    sid
+                )
+                precip_nbr_data[-1]['node_aux'] = node_aux
+                precip_nbr_data[-1]['edge_aux'] = edge_aux            
 
-        for sid in nbr_dict['precip_nbrs']['COSMOS'].SITE_ID:
-            ## get time series data
-            if sid in self.site_data.keys():
-                sdat = self.site_data[sid].copy()
-            else:
-                sdat = read_one_cosmos_site(sid)
-                sdat = sdat.subhourly[self.use_vars]
-                self.site_data[sid] = sdat.copy()
-            
-            # pull out just precip
-            sdat = sdat[['PRECIP']]
-            
-            # trim to desired period, keeping NaNs for missing times
-            sdat = (home_data.reset_index()[['DATE_TIME']]
-                .merge(sdat.reset_index(), how='left', on='DATE_TIME')
-                .set_index('DATE_TIME')
-            )
-
-            # if there is no data at the nbr node, skip
-            if sdat.dropna().shape[0]==0:
-                continue
+            #for sid in nbr_dict['precip_nbrs']['COSMOS'].SITE_ID:
+            for sid in nbr_dict['COSMOS'].SITE_ID:
+                ## get time series data
+                if sid in self.site_data.keys():
+                    sdat = self.site_data[sid].copy()
+                else:
+                    sdat = read_one_cosmos_site(sid)
+                    sdat = sdat.subhourly[self.use_vars]
+                    self.site_data[sid] = sdat.copy()
                 
-            precip_nbr_data.append({'site_id':sid})        
-            precip_nbr_data[-1]['timeseries'] = sdat
-            
-            ## get nbr node and connecting edge metadata        
-            node_aux, edge_aux = self.get_node_and_edge_aux_data(
-                sdat,
-                nbr_dict['precip_nbrs']['COSMOS'],
-                home_meta,
-                sid
-            )
-            precip_nbr_data[-1]['node_aux'] = node_aux
-            precip_nbr_data[-1]['edge_aux'] = edge_aux  
-            
-        ## all var neighbours
-        allvar_nbr_data = []
-        for sid in nbr_dict['other_nbrs']['COSMOS'].SITE_ID:
-            ## get time series data
-            if sid in self.site_data.keys():
-                sdat = self.site_data[sid].copy()
-            else:
-                sdat = read_one_cosmos_site(sid)
-                sdat = sdat.subhourly[self.use_vars]
-                self.site_data[sid] = sdat.copy()
-            
-            # trim to desired period, keeping NaNs for missing times
-            sdat = (home_data.reset_index()[['DATE_TIME']]
-                .merge(sdat.reset_index(), how='left', on='DATE_TIME')
-                .set_index('DATE_TIME')
-            )
-
-            # if there is no data at the nbr node, skip
-            if sdat.dropna(how='all').shape[0]==0:
-                continue
+                # pull out just precip
+                sdat = sdat[['PRECIP']]
                 
-            allvar_nbr_data.append({'site_id':sid})        
-            allvar_nbr_data[-1]['timeseries'] = sdat
-            
-            ## get nbr node and connecting edge metadata        
-            node_aux, edge_aux = self.get_node_and_edge_aux_data(
-                sdat,
-                nbr_dict['other_nbrs']['COSMOS'],
-                home_meta,
-                sid
-            )
-            allvar_nbr_data[-1]['node_aux'] = node_aux
-            allvar_nbr_data[-1]['edge_aux'] = edge_aux
-        return precip_nbr_data, allvar_nbr_data
+                # trim to desired period, keeping NaNs for missing times
+                sdat = (home_data.reset_index()[['DATE_TIME']]
+                    .merge(sdat.reset_index(), how='left', on='DATE_TIME')
+                    .set_index('DATE_TIME')
+                )
+
+                # if there is no data at the nbr node, skip
+                if sdat.dropna().shape[0]==0:
+                    continue
+                    
+                precip_nbr_data.append({'site_id':sid})        
+                precip_nbr_data[-1]['timeseries'] = sdat
+                
+                ## get nbr node and connecting edge metadata        
+                node_aux, edge_aux = self.get_node_and_edge_aux_data(
+                    sdat,
+                    nbr_dict['precip_nbrs']['COSMOS'],
+                    home_meta,
+                    sid
+                )
+                precip_nbr_data[-1]['node_aux'] = node_aux
+                precip_nbr_data[-1]['edge_aux'] = edge_aux
+            return precip_nbr_data
+        else:
+            ## all var neighbours
+            allvar_nbr_data = []
+            #for sid in nbr_dict['other_nbrs']['COSMOS'].SITE_ID:
+            for sid in nbr_dict['COSMOS'].SITE_ID:
+                ## get time series data
+                if sid in self.site_data.keys():
+                    sdat = self.site_data[sid].copy()
+                else:
+                    sdat = read_one_cosmos_site(sid)
+                    sdat = sdat.subhourly[self.use_vars]
+                    self.site_data[sid] = sdat.copy()
+                
+                # trim to desired period, keeping NaNs for missing times
+                sdat = (home_data.reset_index()[['DATE_TIME']]
+                    .merge(sdat.reset_index(), how='left', on='DATE_TIME')
+                    .set_index('DATE_TIME')
+                )
+
+                # if there is no data at the nbr node, skip
+                if sdat.dropna(how='all').shape[0]==0:
+                    continue
+                    
+                allvar_nbr_data.append({'site_id':sid})        
+                allvar_nbr_data[-1]['timeseries'] = sdat
+                
+                ## get nbr node and connecting edge metadata        
+                node_aux, edge_aux = self.get_node_and_edge_aux_data(
+                    sdat,
+                    nbr_dict['other_nbrs']['COSMOS'],
+                    home_meta,
+                    sid
+                )
+                allvar_nbr_data[-1]['node_aux'] = node_aux
+                allvar_nbr_data[-1]['edge_aux'] = edge_aux
+            return allvar_nbr_data
+        #return precip_nbr_data, allvar_nbr_data
 
     def get_node_and_edge_aux_data(self, nbr_timeseries, nbr_dict_meta, home_meta, site_id):
         ## get nbr node metadata        
@@ -438,8 +483,8 @@ class gap_generator():
         return node_aux, edge_aux
     
     def get_batch(self, batch_size,
-                  const_l=True,
-                  batch_type='train',
+                  const_l = True,
+                  batch_type = 'train',
                   min_gap_logprob = -1.5,
                   mean_gap_length = 5,
                   gap_length_sd = 2.5,
@@ -452,7 +497,7 @@ class gap_generator():
         our_gaps = []
         existing_gaps = []
         batch_metadata = []
-        batch_precip_nbrs = []
+        #batch_precip_nbrs = []
         batch_allvar_nbrs = []
         
         if const_l:
@@ -463,7 +508,8 @@ class gap_generator():
             l = None
         
         for b in range(batch_size):
-            m_data, data, gaps, real_gaps, meta, aux, p_nbrs, av_nbrs = self.get_sample(
+            # p_nbrs, av_nbrs
+            m_data, data, gaps, real_gaps, meta, aux, nbrs = self.get_sample(
                 l=l,
                 samp_type=batch_type,
                 min_gap_logprob=min_gap_logprob,
@@ -478,8 +524,8 @@ class gap_generator():
             our_gaps.append(torch.from_numpy(gaps))
             existing_gaps.append(torch.from_numpy(real_gaps))
             batch_metadata.append(meta)
-            batch_precip_nbrs.append(p_nbrs)
-            batch_allvar_nbrs.append(av_nbrs)
+            #batch_precip_nbrs.append(p_nbrs)
+            batch_allvar_nbrs.append(nbrs)
             
         inputs = torch.stack(inputs, dim=0) # B, C, T
         aux_inputs = torch.stack(aux_inputs, dim=0) # B, C, T
@@ -487,15 +533,18 @@ class gap_generator():
         our_gaps = torch.stack(our_gaps, dim=0) # B, C, T
         existing_gaps = torch.stack(existing_gaps, dim=0) # B, C, T
         
-        # tensorise neighbour data
-        for b in range(batch_size):
-            batch_precip_nbrs[b] = tensorise_nbr_data(batch_precip_nbrs[b])
-            batch_allvar_nbrs[b] = tensorise_nbr_data(batch_allvar_nbrs[b])      
+        if self.use_nbrs:
+            # tensorise neighbour data
+            for b in range(batch_size):
+                #batch_precip_nbrs[b] = tensorise_nbr_data(batch_precip_nbrs[b])
+                batch_allvar_nbrs[b] = tensorise_nbr_data(batch_allvar_nbrs[b])
+        else:
+            batch_allvar_nbrs = None
         
         return {'inputs':inputs, 'aux_inputs':aux_inputs,
                 'targets':targets, 'our_gaps':our_gaps,
                 'existing_gaps':existing_gaps, 'metadata':batch_metadata,
-                'precip_nbrs':batch_precip_nbrs, 'allvar_nbrs':batch_allvar_nbrs}
+                'allvar_nbrs':batch_allvar_nbrs} #'precip_nbrs':batch_precip_nbrs}
     
     def normalise(self, data):
         if 'TA' in data.columns:
@@ -562,13 +611,14 @@ class gap_generator():
         )
         return auxiliary_timeseries
     
-    def get_sample(self, l=None, samp_type='train',
+    def get_sample(self, l=None,
+                   samp_type='train',
                    min_gap_logprob = -1.5,
                    mean_gap_length = 5,
                    gap_length_sd = 2.5,
                    shortrange = 10,
                    longrange = 60):
-        # load and subset        
+        ## load and subset
         if l is None:
             l = np.random.randint(self.min_period, self.max_period+1)
             
@@ -586,24 +636,30 @@ class gap_generator():
                 self.site_data[SID] = data.copy()            
             data = data.sort_index()
         
-        # randomly select a subset
+        ## randomly select a subset
         dt0 = np.random.randint(0, data.shape[0]-l-1)
         data = data.iloc[dt0:(dt0+l)]
-
-        # find neighbours for cross-attention
-        nbr_dict = self.connect_to_neighbours(
-            SID, shortrange=shortrange, longrange=longrange
-        )
         
-        # get neighbour data
-        precip_nbr_data, allvar_nbr_data = self.extract_neighbour_data(nbr_dict, data, SID)
+        nbr_data = None
+        if self.use_nbrs:
+            ## find neighbours for cross-attention
+            nbr_dict = self.connect_to_neighbours(
+                SID, shortrange=shortrange, longrange=longrange
+            )
+            
+            ## get neighbour data
+            #precip_nbr_data, allvar_nbr_data = self.extract_neighbour_data(nbr_dict, data, SID)
+            nbr_data = self.extract_neighbour_data(nbr_dict, data, SID)
 
-        # normalise
+        ## normalise
         data = self.normalise(data)
-        for i in range(len(precip_nbr_data)):
-            precip_nbr_data[i]['timeseries'] = self.normalise(precip_nbr_data[i]['timeseries'])
-        for i in range(len(allvar_nbr_data)):
-            allvar_nbr_data[i]['timeseries'] = self.normalise(allvar_nbr_data[i]['timeseries'])   
+        if self.use_nbrs:
+            # for i in range(len(precip_nbr_data)):
+                # precip_nbr_data[i]['timeseries'] = self.normalise(precip_nbr_data[i]['timeseries'])
+            # for i in range(len(allvar_nbr_data)):
+                # allvar_nbr_data[i]['timeseries'] = self.normalise(allvar_nbr_data[i]['timeseries'])
+            for i in range(len(nbr_data)):
+                nbr_data[i]['timeseries'] = self.normalise(nbr_data[i]['timeseries'])
         
         ## create and apply gap masks
         gap_masks, real_gap_masks = create_gap_masks(
@@ -617,34 +673,13 @@ class gap_generator():
         masked_data = masked_data[masked_data.columns.sort_values()]
         data = data[data.columns.sort_values()]
         
-        # find real gap masks for neighbour time series
-        # where neighbours have all vars as gaps, mask from attention
-        for i in range(len(precip_nbr_data)):
-            precip_nbr_data[i]['real_gap_masks'] = create_real_gap_masks(precip_nbr_data[i]['timeseries'])
-            precip_nbr_data[i]['masked_data'] = insert_gaps(precip_nbr_data[i]['timeseries'],
-                                                            gap_masks=None,
-                                                            real_gap_masks=precip_nbr_data[i]['real_gap_masks'])        
-            # for single-variable precip timeseries we don't need
-            # to input the 0/1 mask flags as we will be masking all the
-            # missing times anyway, so just select PRECIP
-            precip_nbr_data[i]['masked_data'] = precip_nbr_data[i]['masked_data'][['PRECIP']]
-            
-            # create attention mask
-            precip_nbr_data[i]['attention_mask'] = np.ones((data.shape[0], precip_nbr_data[i]['timeseries'].shape[0]), dtype=bool)
-            mask_inds = np.where(np.stack([precip_nbr_data[i]['real_gap_masks'][v] for v in ['PRECIP']], axis=0).sum(axis=0) == 1)[0]
-            precip_nbr_data[i]['attention_mask'][:,mask_inds] = False
-
-        for i in range(len(allvar_nbr_data)):
-            allvar_nbr_data[i]['real_gap_masks'] = create_real_gap_masks(allvar_nbr_data[i]['timeseries'])
-            allvar_nbr_data[i]['masked_data'] = insert_gaps(allvar_nbr_data[i]['timeseries'],
-                                                            gap_masks=None,
-                                                            real_gap_masks=allvar_nbr_data[i]['real_gap_masks'])
-            allvar_nbr_data[i]['masked_data'] = allvar_nbr_data[i]['masked_data'][allvar_nbr_data[i]['masked_data'].columns.sort_values()]
-            
-            # create attention mask
-            allvar_nbr_data[i]['attention_mask'] = np.ones((data.shape[0], allvar_nbr_data[i]['timeseries'].shape[0]), dtype=bool)
-            mask_inds = np.where(np.stack([allvar_nbr_data[i]['real_gap_masks'][v] for v in data.columns], axis=0).sum(axis=0) == len(data.columns))[0]
-            allvar_nbr_data[i]['attention_mask'][:,mask_inds] = False
+        if self.use_nbrs:
+            ## find real gap masks for neighbour time series
+            ## where neighbours have all vars as gaps, mask from attention
+            if self.precip:
+                process_precip_nbr_data(nbr_data, data)
+            else:
+                process_nonprecip_nbr_data(nbr_data, data)
        
         ## create auxiliary data
         home_site_meta = self.metadata.site.set_index('SITE_ID').loc[SID]
@@ -670,7 +705,7 @@ class gap_generator():
         real_gap_masks = np.stack([real_gap_masks[v] for v in metadata['var_order']], axis=0)
                 
         return (masked_data, data, gap_masks, real_gap_masks, metadata,
-                aux_timeseries, precip_nbr_data, allvar_nbr_data)
+                aux_timeseries, nbr_data) #precip_nbr_data, allvar_nbr_data)
 
 
 if __name__=="__main__":
