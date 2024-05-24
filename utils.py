@@ -10,6 +10,71 @@ from pathlib import Path
 SQRT2PI = np.sqrt(2 * np.pi)
 EPS = 1e-9
 
+def create_gap_masks(df, min_gap_logprob = -1.5,
+                     mean_gap_length = 5, gap_length_sd = 2.5):
+    # randomly create gaps in one/some/all variables
+    mask_probs = np.logspace(0, min_gap_logprob, df.shape[1])
+    mask_binary = np.random.binomial(1, p=mask_probs).astype(bool)
+    use_vars = list(df.columns).copy()
+    np.random.shuffle(use_vars)
+    gap_masks = {} # where we are creating gaps
+    real_gap_masks = {} # where gaps already exist
+    unmasked = np.zeros(df.shape[0], dtype=bool)
+    for i, var in enumerate(use_vars):
+        real_gap_masks[var] = df[var].isna().values
+        if not mask_binary[i]:
+            gap_masks[var] = unmasked.copy()
+        else:
+            thismask = unmasked.copy()
+            gap_start = np.random.randint(0, df.shape[0])            
+            gap_len = int(np.clip(np.random.normal(mean_gap_length, gap_length_sd),
+                                  a_min=1, a_max=df.shape[0]-gap_start))
+            real_gap_len = len(thismask[gap_start:(gap_start+gap_len)])
+            thismask[gap_start:(gap_start+gap_len)] = True
+            gap_masks[var] = thismask
+    return gap_masks, real_gap_masks
+
+def create_real_gap_masks(df):
+    real_gap_masks = {} # where gaps already exist    
+    for i, var in enumerate(df.columns):
+        real_gap_masks[var] = df[var].isna().values
+    return real_gap_masks
+
+def insert_gaps(df, gap_masks=None, real_gap_masks=None):
+    # apply gap masks to create masked input data
+    use_vars = list(df.columns).copy()
+    for i, var in enumerate(use_vars):
+        this_dat = df[[var]].copy()
+        # mask imagined gaps
+        if gap_masks is None:
+            this_dat[var+'_d'] = np.ones(this_dat.shape[0], dtype=np.int32)
+        else:
+            this_dat.loc[gap_masks[var], var] = 0
+            this_dat[var+'_d'] = (~gap_masks[var]).astype(np.int32)
+        # also mask real gaps
+        if not (real_gap_masks is None):
+            this_dat.loc[real_gap_masks[var], var] = 0
+            this_dat.loc[real_gap_masks[var], var+'_d'] = 0
+        if i==0:
+            masked_data = this_dat.copy()
+        else:
+            masked_data = pd.concat([masked_data, this_dat], axis=1)
+    return masked_data
+
+def zeropad_strint(integer, num=1):
+    if num==1:
+        if integer<10:
+            return '0' + str(integer)
+        else:
+            return str(integer)
+    elif num==2:
+        if integer<10:
+            return '00' + str(integer)
+        elif integer<100:
+            return '0' + str(integer)
+        else:
+            return str(integer)
+
 def count_parameters(model, trainable=True):
     if trainable:
         return sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -41,6 +41,6 @@ normalisation = SimpleNamespace(
     lon_norm = 180.,
     elev_norm = 300.,
     slope_norm = 4.,
-    std_elev_norm = 15.
-    
+    std_elev_norm = 15.,
+    dist_norm = 50.    
 )
